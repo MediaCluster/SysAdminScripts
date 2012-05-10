@@ -1,0 +1,383 @@
+#!/bin/bash
+#
+# Author:       Marco Ziesing
+# Email:        m.ziesing@mediacluster.de
+# Date:         2012-05-10
+# Usage:        firewall { start | stop | restart | status | test } 
+# Description:  JiffyBox ready iptables firewall (based on:
+#               https://wiki.jiffybox.de/Firewall_mit_iptables )
+# 
+# set -x # Uncomment to debug this script
+# set -n # Uncomment to check syntax without any execution
+# 
+
+list_spamhaus=/etc/iptables/spamhaus.txt
+list_zeustracker=/etc/iptables/zeustracker.txt
+
+firewall_start()  {
+   echo "$0: starting firewall"
+   
+   # set wan and lan interface
+   IFACE_EXTERNAL="eth0"
+   IP_EXTERNAL="109.239.48.XX"
+   
+   IFACE_INTERNAL="eth0:0"
+   IP_INTERNAL="10.1.0.XX"
+
+   # set max allowed parallel requests per IP
+   CONCURRENT_REQUESTS=30
+   
+   # check for root user
+   firewall_isroot
+   
+   # check for iptables
+   firewall_check_iptables
+      
+   # init  firewall (throw old things away and set default policy)
+   firewall_init
+   
+   # activate some security options
+   firewall_activate_security
+   
+   # check for max allowed concurrent requests
+   firewall_protect
+
+   # allow established incoming connections
+   firewall_allow_related_in
+   
+   # allow established outgoing connections
+   firewall_allow_related_out
+
+   # allow the loopback device
+   firewall_allow_loopback
+
+   # deny private networks
+   firewall_deny_private
+
+   # block some IPs
+   #firewall_block "123.123.0/24"
+   
+   # deny invalid packages
+   firewall_deny_invalid
+    
+   # allow input PROTOCOL DST-IP PORT 
+   firewall_allow_input TCP $IP_EXTERNAL 25
+   firewall_allow_input TCP 0.0.0.0/0 80
+   firewall_allow_input TCP 0.0.0.0/0 443
+   firewall_allow_input TCP $IP_EXTERNAL 22
+   firewall_allow_input TCP $IP_EXTERNAL 53222
+   
+   # allow output PROTOCOL SRC-IP PORT
+   firewall_allow_output UDP 0.0.0.0/0 53
+   firewall_allow_output UDP 0.0.0.0/0 123
+   firewall_allow_output TCP $IP_EXTERNAL 25
+   firewall_allow_output TCP 0.0.0.0/0 80
+   firewall_allow_output TCP 0.0.0.0/0 443
+
+   #allow dhcp from dhcp server
+   firewall_allow_dhcp 109.239.48.250
+   firewall_allow_dhcp 109.239.48.251
+   firewall_allow_dhcp 109.239.49.251
+
+   # allow ping in and out
+   firewall_allow_ping
+   
+   # allow IPsec ESP Packages
+   #firewall_allow_esp eth0
+
+   # log all dropped packages
+   #firewall_droplog
+
+   # block IPs from Spamhaus DROP
+   firewall_spamhaus
+}
+
+# delete all chains and set default policy to ACCEPT
+firewall_stop() {
+   echo "$0: stopping firewall"
+   
+   /sbin/iptables -F
+   /sbin/iptables -X
+   /sbin/iptables -P INPUT ACCEPT
+   /sbin/iptables -P FORWARD ACCEPT
+   /sbin/iptables -P OUTPUT ACCEPT
+}
+
+# firewall test mode
+firewall_test() {
+   echo "$0: starting firewall for 20 seconds"
+   $0 start
+   sleep 20
+   $0 stop
+}
+
+# restart firwall
+firewall_restart()  {
+   echo "$0: restarting firewall"
+   $0 stop
+   sleep 1
+   $0 start   
+}
+
+# display firewall rules
+firewall_status() {
+   echo "$0: firewall status"
+   iptables -L -vn
+}
+
+
+############# > functions < #############
+
+# check for iptables
+firewall_check_iptables() {
+   if [ ! -x /sbin/iptables ]; then
+      echo "$0: iptables not found"
+      exit 1
+   fi
+}
+
+# check for root user
+firewall_isroot()  {
+   if [ ! $UID -eq 0 ]; then
+      echo "$0: please run this script as root"
+      exit 1
+   fi
+}
+
+# activate some security options
+firewall_activate_security()  {
+   # syncookie protection
+   echo 1 >/proc/sys/net/ipv4/tcp_syncookies
+
+   # disable proxy-ARP
+   for i in /proc/sys/net/ipv4/conf/*; do echo 0 > $i/proxy_arp 2> /dev/null; done
+
+   # ignore faulty ICMP answers
+   echo 1 > /proc/sys/net/ipv4/icmp_ignore_bogus_error_responses 2> /dev/null
+
+   # ignore ICMP echo-broadcasts
+   echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts 2> /dev/null
+
+   # set icmp ratelimit to 500/sec
+   echo 5 > /proc/sys/net/ipv4/icmp_ratelimit
+
+   # set tcp-fin-timeout to 30
+   echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout
+}
+
+# init  firewall (throw old things away and set default policy)
+firewall_init() {
+   /sbin/iptables -F
+   /sbin/iptables -X
+   /sbin/iptables -P INPUT DROP
+   /sbin/iptables -P FORWARD DROP
+   /sbin/iptables -P OUTPUT DROP
+}
+
+# deny private networks
+firewall_deny_private() {
+   /sbin/iptables -A INPUT -s 192.168.0.0/16 -j DROP
+   /sbin/iptables -A INPUT -s 10.0.0.0/8 -j DROP
+   /sbin/iptables -A INPUT -s 127.0.0.0/8 -j DROP
+   /sbin/iptables -A INPUT -s 0.0.0.0/8 -j DROP
+   /sbin/iptables -A INPUT -s 255.0.0.0/8 -j DROP
+}
+
+# block ip
+firewall_block()  {
+   /sbin/iptables -A INPUT -s $1 -j ULOG --ulog-nlgroup 1 --ulog-prefix "Blocked IP: " --ulog-qthreshold 10
+   /sbin/iptables -A INPUT -s $1 -j DROP
+}
+
+# deny invalid packages
+firewall_protect() {
+   # set max current tcp connection limit from one ip 
+   /sbin/iptables -A INPUT -i $IFACE_EXTERNAL -p tcp -m connlimit --connlimit-above $CONCURRENT_REQUESTS -j ULOG --ulog-nlgroup 1 --ulog-prefix "LIMIT: " --ulog-qthreshold 10
+   /sbin/iptables -A INPUT -i $IFACE_EXTERNAL -p tcp -m connlimit --connlimit-above $CONCURRENT_REQUESTS -j DROP
+   
+   # defend portscans
+   /sbin/iptables -A INPUT -i $IFACE_EXTERNAL -p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 1/s -j ACCEPT
+   
+   # defend ping-of-death
+   /sbin/iptables -A INPUT -i $IFACE_EXTERNAL -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT
+}
+
+# deny invalid packages
+firewall_deny_invalid() {
+   # invalid incoming
+   /sbin/iptables -A INPUT -m state --state INVALID -j DROP
+   # NEW and no SYN flag
+   /sbin/iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
+   # no flags
+   /sbin/iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
+   # SYN and FIN is set
+   /sbin/iptables -A INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+   # SYN and RST is set
+   /sbin/iptables -A INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+   # FIN and RST is set
+   /sbin/iptables -A INPUT -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+   # FIN without ACK
+   /sbin/iptables -A INPUT -p tcp --tcp-flags ACK,FIN FIN -j DROP
+   # PSH without ACK
+   /sbin/iptables -A INPUT -p tcp --tcp-flags ACK,PSH PSH -j DROP
+   # URG without ACK
+   /sbin/iptables -A INPUT -p tcp --tcp-flags ACK,URG URG -j DROP
+   # invalid outgoing
+   /sbin/iptables -A OUTPUT -m state --state INVALID -j DROP      
+}
+
+# allow established incoming connections
+firewall_allow_related_in() {
+   /sbin/iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+}
+
+# allow established outgoing connections
+firewall_allow_related_out() {
+   /sbin/iptables -A OUTPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+}
+
+# allow input
+# three arguments: PROTOCOL DST-IP PORT 
+firewall_allow_input() {
+   if [ $# -eq 3 ]; then
+      /sbin/iptables -A INPUT -p $1 -d $2 --dport $3 -m state --state NEW -j ACCEPT
+      return 0
+   else
+      echo "$0: syntax error for firewall_allow_input $1 $2 $3"
+      echo "$0: arguments: PROTOCOL DST-IP PORT"
+      return 1
+   fi
+}
+
+# alow output
+# three arguments: PROTOCOL SRC-IP PORT
+firewall_allow_output()  {
+   if [ $# -eq 3 ]; then
+      /sbin/iptables -A OUTPUT -p $1  -s $2 --dport $3 -m state --state NEW -j ACCEPT
+      return 0
+   else
+      echo "$0: syntax error for firewall_allow_output $1 $2 $3"
+      echo "$0: arguments: PROTOCOL SRC-IP PORT"
+      return 1
+   fi
+}
+
+# allow input
+# three arguments: PROTOCOL DST-IP PORT 
+firewall_allow_dhcp() {
+   if [ $# -eq 1 ]; then
+      /sbin/iptables -A INPUT -p UDP -d $IP_EXTERNAL --dport 68 -s $1 -m state --state NEW -j ACCEPT
+      /sbin/iptables -A OUTPUT -p UDP -s $IP_EXTERNAL -d $1 --dport 67 -m state --state NEW -j ACCEPT
+      return 0
+   else
+      echo "$0: syntax error for firewall_allow_dhcp $1"
+      echo "$0: arguments: PROTOCOL DST-IP PORT"
+      return 1
+   fi
+}
+
+
+# allow IPsec ESP Packages
+# one argument: INTERFACE
+firewall_allow_esp() {
+   if [ $# -eq 1 ]; then
+      /sbin/iptables -A INPUT -i $1 -p 50 -m state --state NEW -j ACCEPT
+      /sbin/iptables -A OUTPUT -o $1 -p 50 -m state --state NEW -j ACCEPT
+
+      # enable ip forwarding
+      echo 1 >/proc/sys/net/ipv4/ip_forward
+
+      # stop icmp redirecting
+      for i in /proc/sys/net/ipv4/conf/*/accept_redirects; do echo 0 > $i 2> /dev/null; done
+      for i in /proc/sys/net/ipv4/conf/*/send_redirects; do echo 0 > $i 2> /dev/null; done
+   else
+      echo "$0: syntax error for firewall_allow_esp $1"
+      echo "$0: arguments: INTERFACE"
+      return 1
+   fi
+}
+
+# allow ping in and out
+firewall_allow_ping() {
+   /sbin/iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+   /sbin/iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+   /sbin/iptables -A OUTPUT -p icmp --icmp-type echo-request -j ACCEPT
+}
+
+# allow the loopback device
+firewall_allow_loopback() {
+   /sbin/iptables -A INPUT -i lo -s 127.0.0.1 -d 127.0.0.1 -j ACCEPT
+   /sbin/iptables -A OUTPUT -o lo -s 127.0.0.1 -d 127.0.0.1 -j ACCEPT
+}
+
+
+firewall_droplog() {
+   /sbin/iptables -A INPUT -p tcp -j ULOG --ulog-nlgroup 1 --ulog-prefix "DROP: " --ulog-qthreshold 10
+   /sbin/iptables -A INPUT -p udp -j ULOG --ulog-nlgroup 1 --ulog-prefix "DROP: " --ulog-qthreshold 10
+
+   /sbin/iptables -A OUTPUT -p tcp -j ULOG --ulog-nlgroup 1 --ulog-prefix "DROP: " --ulog-qthreshold 10 
+   /sbin/iptables -A OUTPUT -p udp -j ULOG --ulog-nlgroup 1 --ulog-prefix "DROP: " --ulog-qthreshold 10
+}
+
+# Drop packets originating from the IPs contained in the SPAMHAUS DROP (Don't Route Or Peer) list
+firewall_spamhaus() {
+  if [ -s $list_spamhaus ]; then
+    for i in $(cat $list_spamhaus | grep -i SBL | cut -f  1 -d ';' )
+    do
+      ### echo BLOCKING $i            
+      #/sbin/iptables -t filter -A INPUT --src $i -j DROP
+      firewall_block $i
+    done
+  else
+    echo "$list_spamhaus not found!"
+  fi
+}
+
+# Drop packets originating from the IPs contained in the ZEUS TRACKER BLOCKLIST
+firewall_zeustracker() {
+  if [ -s $list_zeustracker ]; then
+    for i in $(cat list_zeustracker | grep -i SBL | cut -f  1 -d ';' )
+    do
+      ### echo BLOCKING $i            
+      #/sbin/iptables -t filter -A INPUT --src $i -j DROP
+      firewall_block $i
+    done
+  else
+    echo "$list_zeustracker not found!"
+  fi
+}
+
+############# > init.d handling < #############
+
+case "$1" in
+start)
+   firewall_start
+   exit 0
+;;
+
+stop)
+   firewall_stop      
+   exit 0
+;;
+
+test)
+   firewall_test
+   exit 0
+;;
+
+restart)        
+   firewall_restart
+   exit 0
+;;
+
+status)
+   firewall_status
+   exit 0
+;;
+
+*)
+   echo "$0: iptables Firewall"
+   echo "$0: { start | stop | restart | status | test }"
+   exit 0
+;;
+esac
